@@ -300,6 +300,8 @@ nav.tabs button.on{color:var(--primary)}
   <div class="sheet">
     <div class="grab"></div>
     <h2 id="add-title">Add expense</h2>
+    <button class="btn secondary" id="add-scan" style="margin-top:2px">📷 Scan receipt</button>
+    <div id="scan-status" style="font-size:13px;color:var(--muted);min-height:20px;margin:4px 0 2px"></div>
     <input type="hidden" id="add-id">
     <label class="f">Amount</label>
     <input id="add-amt" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0.00" style="font-size:28px;font-weight:800">
@@ -800,6 +802,112 @@ window.ET = { defaultState, load, save, get S(){return S;}, set S(v){S=v;},
   uid, todayStr, fmtD, parseD, addDays, money, catById, esc, prettyDate, monthKey,
   sumWhere, expensesBetween, totalsFor, byCategory, dailyTotals, weekRange,
   validateExpense, addExpense, isRecurringDue, donutSVG, colorFor };
+</script>
+<script>
+"use strict";
+/* ============================== RECEIPT SCAN (OCR) ==============================
+   Optional add-on: the OCR engine loads lazily from CDN only when the user taps
+   "Scan receipt". Everything else in the app keeps working fully offline. */
+const TESS_CDN_URL = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
+function loadTesseract(){
+  return new Promise((resolve,reject)=>{
+    if(window.Tesseract) return resolve(window.Tesseract);
+    const s=document.createElement("script");
+    s.src=TESS_CDN_URL; s.async=true;
+    s.onload=()=>{ window.Tesseract?resolve(window.Tesseract):reject(new Error("scanner engine missing")); };
+    s.onerror=()=>reject(new Error("couldn't download the scanner"));
+    document.head.appendChild(s);
+  });
+}
+function prepReceiptImage(file){
+  return new Promise((resolve,reject)=>{
+    const img=new Image(), url=URL.createObjectURL(file);
+    img.onload=()=>{
+      URL.revokeObjectURL(url);
+      try{
+        const max=1600, k=Math.min(1,max/Math.max(img.width||1,img.height||1));
+        const c=document.createElement("canvas");
+        c.width=Math.max(1,Math.round(img.width*k));
+        c.height=Math.max(1,Math.round(img.height*k));
+        c.getContext("2d").drawImage(img,0,0,c.width,c.height);
+        c.toBlob(b=>b?resolve(b):reject(new Error("couldn't read the photo")),"image/jpeg",0.85);
+      }catch(e){ reject(e); }
+    };
+    img.onerror=()=>{ URL.revokeObjectURL(url); reject(new Error("couldn't read the photo")); };
+    img.src=url;
+  });
+}
+async function ocrReceiptImage(blob,onProgress){
+  const T=await loadTesseract();
+  const worker=await T.createWorker("eng",1,{logger:m=>{ if(m&&m.status==="recognizing text"&&onProgress) onProgress(Math.round((m.progress||0)*100)); }});
+  try{ const r=await worker.recognize(blob); return (r&&r.data&&r.data.text)||""; }
+  finally{ try{ await worker.terminate(); }catch(e){} }
+}
+function receiptMoneyVals(line){
+  const clean=String(line)
+    .replace(/\b\d{4}[\/\-.]\d{1,2}[\/\-.]\d{1,2}\b/g," ")   // dates: 2026-09-27
+    .replace(/\b\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}\b/g," ") // dates: 09/28/2026
+    .replace(/\b\d{1,2}:\d{2}\b/g," ")                        // times: 14:32
+    .replace(/\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g," ");     // phone numbers
+  const out=[], re=/\$?\s?(\d[\d,]*(?:\.\d{2})?)/g; let m;
+  while((m=re.exec(clean))){ const n=parseFloat(m[1].replace(/,/g,"")); if(n>0&&n<1000000) out.push(n); }
+  return out;
+}
+function parseReceiptText(text){
+  const lines=String(text||"").split(/\n+/).map(l=>l.trim()).filter(l=>l.length>1);
+  let total=null;
+  const keyRe=/\b(total|amount due|balance due|grand total|amt due|total due)\b/i;
+  lines.forEach(l=>{ if(keyRe.test(l)){ const a=receiptMoneyVals(l); if(a.length) total=Math.max(total||0,Math.max.apply(null,a)); }});
+  if(total==null){ let mx=0; lines.forEach(l=>receiptMoneyVals(l).forEach(n=>{ if(n>mx) mx=n; })); if(mx>0) total=mx; }
+  let merchant="";
+  for(const l of lines){
+    if(/(\d{3}[-.\s]?\d{3}[-.\s]?\d{4})|(https?:\/\/|www\.|\.com\b|\.ca\b|@)/i.test(l)) continue;
+    if(/^[\d\s\-().+]+$/.test(l)) continue;
+    merchant=l.replace(/^[^A-Za-z0-9&']+/,"").slice(0,60); break;
+  }
+  const MO={jan:"01",feb:"02",mar:"03",apr:"04",may:"05",jun:"06",jul:"07",aug:"08",sep:"09",oct:"10",nov:"11",dec:"12"};
+  const iso=(y,m,d)=>{ y=+y; m=+m; d=+d; if(!(m>=1&&m<=12&&d>=1&&d<=31)) return null; if(y<100) y+=2000; return y+"-"+String(m).padStart(2,"0")+"-"+String(d).padStart(2,"0"); };
+  let date=null, m;
+  for(const l of lines){
+    if((m=l.match(/\b(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})\b/))) date=iso(m[1],m[2],m[3]);
+    else if((m=l.match(/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})\b/))) date=iso(m[3],m[1],m[2]);
+    else if((m=l.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b/i))) date=iso(m[3],MO[m[1].slice(0,3).toLowerCase()],m[2]);
+    if(date) break;
+  }
+  return {total:total, merchant:merchant, date:date};
+}
+function startReceiptScan(opts){
+  const input=document.createElement("input");
+  input.type="file"; input.accept="image/*"; input.setAttribute("capture","environment");
+  input.style.display="none";
+  input.onchange=async ()=>{
+    const file=input.files&&input.files[0]; input.remove();
+    if(!file) return;
+    const st=opts.statusEl, say=t=>{ if(st) st.textContent=t; };
+    try{
+      say("Preparing photo…");
+      const blob=await prepReceiptImage(file);
+      say("Loading scanner… (needs internet the first time)");
+      const text=await ocrReceiptImage(blob,p=>say("Scanning receipt… "+p+"%"));
+      say("Reading receipt…");
+      const r=parseReceiptText(text), got=[];
+      if(r.total!=null){ opts.fill("amount",r.total.toFixed(2)); got.push("amount"); }
+      if(r.merchant){ opts.fill("note",r.merchant); got.push("merchant"); }
+      if(r.date){ opts.fill("date",r.date); got.push("date"); }
+      say(got.length ? "✓ Detected from receipt — review before saving." : "Couldn't read this receipt clearly — please enter the details manually.");
+    }catch(e){
+      say("Scan failed ("+((e&&e.message)||"error")+"). Check your connection and try again, or enter it manually.");
+    }
+  };
+  document.body.appendChild(input);
+  input.click();
+}
+
+/* ---- wire receipt scan into the Add-expense sheet ---- */
+$("add-scan").addEventListener("click",()=>startReceiptScan({
+  statusEl:$("scan-status"),
+  fill:(k,v)=>{ if(k==="amount")$("add-amt").value=v; else if(k==="note")$("add-note").value=v; else if(k==="date")$("add-date").value=v; }
+}));
 </script>
 </body>
 </html>
