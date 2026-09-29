@@ -715,16 +715,38 @@ function openCategoryModal(){
       save(); openCategoryModal(); toast("Category deleted");
     }));
 }
-function exportCSV(){
+/* File exports use Android's native share sheet in the app: the WebView
+   silently swallows blob downloads, so we write the file and share it. */
+function isNativeApp(){
+  return !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+}
+function blobToBase64(blob){
+  return new Promise((resolve,reject)=>{
+    const r=new FileReader();
+    r.onload=()=>resolve(String(r.result).split(",")[1]);
+    r.onerror=reject;
+    r.readAsDataURL(blob);
+  });
+}
+async function exportCSV(){
   const head = "date,category,note,amount,currency";
   const rows = [...S.expenses].sort((a,b)=>a.date<b.date?-1:1).map(e=>
     [e.date, '"'+catById(e.cat).name.replace(/"/g,'""')+'"', '"'+(e.note||"").replace(/"/g,'""')+'"', e.amount.toFixed(2), S.settings.currency].join(","));
   const blob = new Blob([[head].concat(rows).join("\n")], {type:"text/csv"});
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = "expenses-"+todayStr()+".csv";
-  document.body.appendChild(a); a.click(); a.remove();
-  toast("CSV exported");
+  const fname = "expenses-"+todayStr()+".csv";
+  try{
+    if(isNativeApp() && window.__nativeSharePdf){
+      await window.__nativeSharePdf(await blobToBase64(blob), fname, "Expense Tracker export");
+    }else{
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = fname;
+      document.body.appendChild(a); a.click(); a.remove();
+    }
+    toast("CSV exported");
+  }catch(err){
+    toast("Export failed: "+(err&&err.message?err.message:String(err)));
+  }
 }
 
 /* ============================== ONBOARDING ============================== */
@@ -917,5 +939,6 @@ $("add-scan").addEventListener("click",()=>startReceiptScan({
   fill:(k,v)=>{ if(k==="amount")$("add-amt").value=v; else if(k==="note")$("add-note").value=v; else if(k==="date")$("add-date").value=v; }
 }));
 </script>
+<script src="share-bridge.js"></script>
 </body>
 </html>
